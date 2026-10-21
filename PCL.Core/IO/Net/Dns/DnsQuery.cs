@@ -43,8 +43,9 @@ public class DnsQuery : IDisposable
         "162.125.", // Dropbox
         "4.36.66.", "8.7.198.", "37.61.54.", "46.82.174.", "59.24.3.", "64.33.", "64.66.163.",
         "65.104.202.", "65.160.219.", "66.45.252.", "72.14.205.", "78.16.49.", "93.46.8.89",
-        "128.121.126.", "159.106.121.", "169.132.13.", "188.5.4.", "189.163.17.", "192.67.198.",
-        "197.4.4.", "202.106.1.", "203.98.7.", "207.123.56.", "243.185.187.", "249.129.46.",
+        "128.121.126.", "128.242.240.", "159.106.121.", "169.132.13.", "188.5.4.", "189.163.17.", "192.67.198.",
+        "197.4.4.", "199.59.148.", "199.59.149.", "199.59.150.", "199.59.151.",
+        "202.106.1.", "203.98.7.", "207.123.56.", "243.185.187.", "249.129.46.",
         "253.157.14.",
         "2a03:2880:" // Facebook IPv6
     ];
@@ -53,7 +54,11 @@ public class DnsQuery : IDisposable
 
     // JSON DoH 结果缓存，避免每次连接都重复查询
     private readonly ConcurrentDictionary<string, (IPAddress[] Addresses, DateTime ExpireAt)> _jsonCache = new();
-    private static readonly TimeSpan JsonCacheDuration = TimeSpan.FromMinutes(5);
+
+    /// <summary>单次 JSON DoH 请求的超时，避免端点卡住时把解析拖到分钟级。</summary>
+    private static readonly TimeSpan JsonRequestTimeout = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan JsonCacheMinDuration = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan JsonCacheMaxDuration = TimeSpan.FromMinutes(5);
 
     private DnsQuery()
     {
@@ -137,23 +142,20 @@ public class DnsQuery : IDisposable
 
         // DoH 结果全部可疑：改用 JSON 接口重新查询（通常能拿到未被污染的结果）
         if (addresses.Length > 0)
-            LogWrapper.Warn(ModuleName,
+            LogWrapper.Debug(ModuleName,
                 $"{host} 的 DoH 结果均为已知污染地址（{string.Join(", ", addresses.Select(static x => x.ToString()))}），改用 JSON DoH 重新查询");
 
         var jsonAddresses = (await QueryJsonAsync(host, cts).ConfigureAwait(false))
             .Where(static x => !IsSuspicious(x)).ToArray();
         if (jsonAddresses.Length > 0)
         {
-            LogWrapper.Info(ModuleName,
+            LogWrapper.Debug(ModuleName,
                 $"JSON DoH 为 {host} 解析到 {string.Join(", ", jsonAddresses.Select(static x => x.ToString()))}");
             return jsonAddresses;
         }
 
-        // JSON 查询也没结果：退回原始结果（总比直接失败好），或最终回退到系统 DNS
-        if (addresses.Length > 0)
-            return addresses;
-
-        LogWrapper.Warn(ModuleName, $"Failed to query IP for host {host} using DoH, use system default DNS");
+        // JSON 查询也没拿到可用地址：交给系统 DNS，而不是把已知不可用的污染地址交给连接层去挨个超时
+        LogWrapper.Warn(ModuleName, $"DoH 未能为 {host} 解析到可用地址，改用系统默认 DNS");
         return await System.Net.Dns.GetHostAddressesAsync(host, cts);
     }
 
@@ -169,8 +171,10 @@ public class DnsQuery : IDisposable
             return cached.Addresses;
 
         var result = new List<IPAddress>();
+        var minTtl = int.MaxValue;
         foreach (var recordType in new[] { "A", "AAAA" })
         {
+            var found = false;
             foreach (var server in JsonDohServers)
             {
                 try
@@ -178,19 +182,33 @@ public class DnsQuery : IDisposable
                     var url = $"{server}?name={Uri.EscapeDataString(host)}&type={recordType}";
                     using var request = new HttpRequestMessage(HttpMethod.Get, url);
                     request.Headers.Accept.ParseAdd("application/dns-json");
-                    using var response = await _jsonClient.SendAsync(request, cts).ConfigureAwait(false);
+                    // 单次请求单独设超时：端点卡住时不应把整次解析拖到分钟级
+                    using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cts);
+                    requestTimeout.CancelAfter(JsonRequestTimeout);
+                    using var response = await _jsonClient.SendAsync(request, requestTimeout.Token).ConfigureAwait(false);
                     if (!response.IsSuccessStatusCode) continue;
-                    var json = await response.Content.ReadAsStringAsync(cts).ConfigureAwait(false);
+                    var json = await response.Content.ReadAsStringAsync(requestTimeout.Token).ConfigureAwait(false);
                     var answers = JsonNode.Parse(json)?["Answer"]?.AsArray();
                     if (answers is null) continue;
+
                     foreach (var answer in answers)
                     {
-                        var data = answer?["data"]?.GetValue<string>();
-                        if (data is not null && IPAddress.TryParse(data, out var address))
-                            result.Add(address);
+                        if (answer is not JsonObject answerObject) continue;
+                        var data = answerObject["data"]?.ToString();
+                        if (string.IsNullOrWhiteSpace(data) || !IPAddress.TryParse(data, out var address)) continue;
+                        // 污染过的答案不予采纳，继续尝试下一台服务器
+                        if (IsSuspicious(address)) continue;
+
+                        result.Add(address);
+                        found = true;
+
+                        // 已采纳记录中最小的 TTL 决定缓存时长，避免记录变更后仍返回过期地址
+                        if (int.TryParse(answerObject["TTL"]?.ToString(), out var ttl) && ttl > 0 && ttl < minTtl)
+                            minTtl = ttl;
                     }
 
-                    break; // 该记录类型已从当前服务器取得结果，换下一种类型
+                    // 只有真正取到地址才停止尝试后续服务器；空应答时继续问下一台
+                    if (found) break;
                 }
                 catch (OperationCanceledException) when (cts.IsCancellationRequested)
                 {
@@ -206,7 +224,14 @@ public class DnsQuery : IDisposable
 
         var addresses = result.Distinct().ToArray();
         if (addresses.Length > 0)
-            _jsonCache[host] = (addresses, DateTime.UtcNow + JsonCacheDuration);
+        {
+            var duration = minTtl == int.MaxValue
+                ? JsonCacheMaxDuration
+                : TimeSpan.FromSeconds(Math.Clamp(minTtl, JsonCacheMinDuration.TotalSeconds,
+                    JsonCacheMaxDuration.TotalSeconds));
+            _jsonCache[host] = (addresses, DateTime.UtcNow + duration);
+        }
+
         return addresses;
     }
 

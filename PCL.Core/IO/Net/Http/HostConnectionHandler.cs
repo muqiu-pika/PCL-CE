@@ -81,9 +81,8 @@ public class HostConnectionHandler
                 .ConfigureAwait(false);
             var stream = await winner.ConfigureAwait(false);
 
-            // 更新缓存 + 记录成功
+            // 成功记录已在 _DelayedConnectAsync 中按完成时刻写入，这里不再用解析前捕获的时间重复覆盖
             var remoteIp = ((IPEndPoint)stream.Socket.RemoteEndPoint!).Address;
-            _UpdateConnectionCache(host, port, remoteIp, now);
             LogWrapper.Debug(ModuleName, $"Connected to {host} via {remoteIp}");
 
             // 取消其他连接
@@ -127,6 +126,15 @@ public class HostConnectionHandler
 
         foreach (var ip in addresses)
         {
+            // 先判断失败记录：最近连不通的地址即使曾经成功过，也要降到末尾，避免反复优先尝试坏地址
+            if (failureCache is not null &&
+                failureCache.TryGetValue(ip, out var failureTime) &&
+                now - failureTime <= _FailureDuration)
+            {
+                failedAddresses.Add(ip);
+                continue;
+            }
+
             if (addressCache is not null &&
                 addressCache.TryGetValue(ip, out var successTime) &&
                 now - successTime <= _CacheDuration)
@@ -135,13 +143,7 @@ public class HostConnectionHandler
                 continue;
             }
 
-            // 最近连不通的地址放到最后，仅在其余地址不足时才使用
-            if (failureCache is not null &&
-                failureCache.TryGetValue(ip, out var failureTime) &&
-                now - failureTime <= _FailureDuration)
-                failedAddresses.Add(ip);
-            else
-                uncachedAddresses.Add(ip);
+            uncachedAddresses.Add(ip);
         }
 
         // 缓存地址: 按成功时间倒序 (最近成功的优先)
@@ -192,8 +194,8 @@ public class HostConnectionHandler
             }
         }
 
-        // 更新当前IP
-        addressCache[ip] = now;
+        // 更新当前IP（时间戳只允许向前推进，避免并发连接乱序完成时把成功时间写回更早的时刻）
+        addressCache.AddOrUpdate(ip, now, (_, existing) => existing > now ? existing : now);
     }
 
     private void _UpdateFailureCache(string host, int port, IPAddress ip, DateTime now)
@@ -212,6 +214,10 @@ public class HostConnectionHandler
         }
 
         failureCache[ip] = now;
+
+        // 同时清掉该地址的成功记录，否则失败后它仍会被当成“最近成功地址”优先尝试
+        if (_connectionCache.TryGetValue(cacheKey, out var successCache))
+            successCache.TryRemove(ip, out _);
     }
 
     private async Task<NetworkStream> _DelayedConnectAsync(string host, int port, IPAddress ip, int delay,
